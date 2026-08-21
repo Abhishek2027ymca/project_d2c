@@ -1,6 +1,7 @@
 import express, { type Request, type Response } from 'express';
 import 'dotenv/config';
 import pool from './db/connection.js';
+import { enqueueTicket } from './queue/ticketQueue.js';
 import type { AgentRun, AgentStep, Approval, Ticket } from './types.js';
 
 const app = express();
@@ -58,6 +59,21 @@ app.post('/tickets', async (req: Request, res: Response) => {
     );
 
     await client.query('COMMIT');
+
+    // Queued after commit, not inside the transaction: the ticket/run rows are
+    // the source of truth. If the queue is unreachable the ticket still exists
+    // and can be requeued later — it must not vanish because Redis was down.
+    try {
+      await enqueueTicket({ ticketId: ticket.id, runId: run.id });
+    } catch (queueErr) {
+      console.error(`Failed to enqueue run ${run.id}:`, queueErr);
+      await pool.query('INSERT INTO audit_log (run_id, event_type, payload) VALUES ($1, $2, $3)', [
+        run.id,
+        'enqueue_failed',
+        JSON.stringify({ error: queueErr instanceof Error ? queueErr.message : String(queueErr) }),
+      ]);
+    }
+
     res.status(201).json({ ticket_id: ticket.id, run_id: run.id, status: run.status });
   } catch (err) {
     await client.query('ROLLBACK');
