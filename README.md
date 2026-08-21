@@ -49,6 +49,18 @@ built, key decisions, and bugs hit along the way.
 > shape either way (`src/db/connection.ts`, `src/queue/connection.ts`), so
 > switching back later is a config change, not a code change.
 
+## Verification
+
+Two smoke tests, both runnable without an LLM API key:
+
+```
+npm run verify:tools   # the three agent tools, straight against Postgres
+npm run verify:queue   # queue producer: dedup, job shape, retry config
+```
+
+`verify:tools` is destructive — it issues real refunds against seeded orders.
+Restore with `npm run db:seed` afterwards (it reminds you on exit).
+
 ## API Endpoints
 
 - `GET /health` — health check

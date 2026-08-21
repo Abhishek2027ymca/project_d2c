@@ -145,14 +145,53 @@ What the switch actually cost:
 Model defaults to `gemini-2.5-flash` (free tier, highest daily request cap),
 overridable via `GEMINI_MODEL` without a code change.
 
+### Verification scripts
+Two runnable smoke tests, both of which work without an LLM key. They exist
+so that when the agent later does something unexpected, the first question —
+*is it the tools or the model?* — has an immediate answer.
+
+`npm run verify:tools` — 15 checks, all passing. Exercises the three tools
+directly against Postgres:
+- policy verdicts for delivered / already-refunded / cancelled / unshipped
+- over-amount, negative amount, and blank-reason refunds all rejected
+- policy re-checked at execution time (an ineligible order is blocked even
+  when `issueRefund` is called directly, bypassing the model entirely)
+- **a second refund on the same order is rejected, and exactly one
+  `refund_issued` audit entry exists afterwards** — the rejection is a real
+  block, not a silent no-op that still logged
+- destructive by design; prints a re-seed reminder on exit
+
+`npm run verify:queue` — 6 checks, all passing. Producer side only:
+- repeat enqueues of the same run collapse to one job (the `jobId` scheme)
+- job id derivation, payload shape, retry config
+- cleans up its own scratch job, safe against a live queue
+
+### End-to-end plumbing verified (without the LLM)
+Ran the whole path with `GEMINI_API_KEY` deliberately unset:
+`POST /tickets` → row in Postgres → job `run-1` in Redis with the right
+payload → worker consumed it → failed with a clear, actionable message.
+
+Two things this confirmed that are easy to assume and worth actually seeing:
+- **BullMQ retried exactly 3 times** with backoff, matching `attempts: 3`.
+- The run ended `failed` with `completed_at` set, and the audit log captured
+  *every* attempt — three `run_started` → `run_failed` pairs, not just the
+  final state. Append-only means full forensic history, which is the whole
+  point of the table.
+
+Also worth noting: a missing API key fails the *run*, not the worker process.
+The Gemini client is constructed lazily inside the loop for exactly this
+reason — one misconfigured run shouldn't take down the consumer.
+
 ### Status: blocked / pending
 - [x] `REDIS_URL` — fixed with a fresh Upstash token, verified `PING → PONG`
       plus a real set/get round trip
-- [ ] `GEMINI_API_KEY` not yet set — required to run the agent loop for real
+- [x] Tools verified independently (15/15)
+- [x] Queue producer + consumer plumbing verified (6/6, plus the live run above)
+- [ ] `GEMINI_API_KEY` not yet set — the only remaining blocker
       (free, no card: https://aistudio.google.com/apikey)
-- [ ] Once set: verify one ticket end-to-end —
-      `POST /tickets` → queued → worker picks it up → Gemini calls tools →
-      `agent_steps` rows appear → run reaches `completed`
+- [ ] Once set: the real end-to-end run — Gemini actually calling
+      `lookup_order` → `check_refund_policy` → `issue_refund`, with
+      `agent_steps` rows appearing and the run reaching `completed`
 
 ---
 
