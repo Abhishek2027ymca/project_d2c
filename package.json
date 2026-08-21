@@ -11,7 +11,8 @@
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
     "db:migrate": "tsx src/db/migrate.ts",
-    "db:seed": "tsx src/db/seed.ts"
+    "db:seed": "tsx src/db/seed.ts",
+    "verify:tools": "tsx src/scripts/verifyTools.ts"
   },
   "keywords": [],
   "author": "Abhishek Singh",
