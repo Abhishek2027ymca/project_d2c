@@ -1,7 +1,7 @@
-import Anthropic from '@anthropic-ai/sdk';
+import { GoogleGenAI, type Content, type Part } from '@google/genai';
 import pool from '../db/connection.js';
 import { executeTool } from './executeTool.js';
-import { TOOL_SCHEMAS } from './toolSchemas.js';
+import { TOOL_DECLARATIONS } from './toolSchemas.js';
 import type { RunStatus, Ticket } from '../types.js';
 
 /**
@@ -10,6 +10,12 @@ import type { RunStatus, Ticket } from '../types.js';
  * the job would never resolve.
  */
 const MAX_ITERATIONS = 8;
+
+/**
+ * Free tier defaults to Flash: highest requests-per-day of the free models,
+ * which matters when iterating on a demo. Overridable without touching code.
+ */
+const MODEL = process.env.GEMINI_MODEL ?? 'gemini-2.5-flash';
 
 const SYSTEM_PROMPT = `You are a support-ops agent for a D2C e-commerce company.
 You investigate customer support tickets using the tools provided and decide what
@@ -80,17 +86,22 @@ async function writeStep(
   );
 }
 
-// Constructed lazily, inside the try block below — if ANTHROPIC_API_KEY is
-// missing, that failure belongs to the run (marked 'failed'), not to the
-// whole worker process crashing on import.
-let anthropic: Anthropic | null = null;
-function getClient(): Anthropic {
-  anthropic ??= new Anthropic();
-  return anthropic;
+// Constructed lazily: if GEMINI_API_KEY is missing, that failure belongs to the
+// run (marked 'failed') rather than crashing the whole worker on import.
+let genai: GoogleGenAI | null = null;
+function getClient(): GoogleGenAI {
+  if (!genai) {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      throw new Error('GEMINI_API_KEY is not set. Copy .env.example to .env and fill it in.');
+    }
+    genai = new GoogleGenAI({ apiKey });
+  }
+  return genai;
 }
 
 /**
- * The agent loop for one run: ask Claude what to do, execute whatever tools it
+ * The agent loop for one run: ask Gemini what to do, execute whatever tools it
  * calls, feed the results back, repeat until it stops calling tools or the
  * iteration cap is hit.
  *
@@ -102,14 +113,23 @@ export async function runAgentLoop(ticketId: number, runId: number): Promise<voi
   const ctx = await loadTicketContext(ticketId);
 
   await updateRunStatus(runId, 'running', false);
-  await writeAuditLog(runId, 'run_started', { ticket_id: ticketId });
+  await writeAuditLog(runId, 'run_started', { ticket_id: ticketId, model: MODEL });
 
-  const messages: Anthropic.MessageParam[] = [
+  // Gemini keeps conversation state in `contents`: each turn is appended, and
+  // the whole array is resent every call. The model's own turns must be echoed
+  // back verbatim or it loses track of which tool call a result belongs to.
+  const contents: Content[] = [
     {
       role: 'user',
-      content:
-        `Customer ticket (id ${ticketId}):\n"""\n${ctx.message}\n"""\n\n` +
-        (ctx.orderId ? `Related order id: ${ctx.orderId}.` : 'No order was referenced in this ticket.'),
+      parts: [
+        {
+          text:
+            `Customer ticket (id ${ticketId}):\n"""\n${ctx.message}\n"""\n\n` +
+            (ctx.orderId
+              ? `Related order id: ${ctx.orderId}.`
+              : 'No order was referenced in this ticket.'),
+        },
+      ],
     },
   ];
 
@@ -117,25 +137,28 @@ export async function runAgentLoop(ticketId: number, runId: number): Promise<voi
 
   try {
     for (let iteration = 0; iteration < MAX_ITERATIONS; iteration++) {
-      const response = await getClient().messages.create({
-        model: 'claude-opus-5',
-        max_tokens: 4096,
-        system: SYSTEM_PROMPT,
-        tools: TOOL_SCHEMAS,
-        messages,
+      const response = await getClient().models.generateContent({
+        model: MODEL,
+        contents,
+        config: {
+          systemInstruction: SYSTEM_PROMPT,
+          tools: [{ functionDeclarations: TOOL_DECLARATIONS }],
+        },
       });
 
-      messages.push({ role: 'assistant', content: response.content });
+      const candidateParts = response.candidates?.[0]?.content?.parts ?? [];
+      const reasoning =
+        candidateParts
+          .map((p) => p.text ?? '')
+          .join('\n')
+          .trim() || null;
 
-      const textBlocks = response.content.filter(
-        (b): b is Anthropic.TextBlock => b.type === 'text',
-      );
-      const toolUseBlocks = response.content.filter(
-        (b): b is Anthropic.ToolUseBlock => b.type === 'tool_use',
-      );
-      const reasoning = textBlocks.map((b) => b.text).join('\n').trim() || null;
+      const functionCalls = response.functionCalls ?? [];
 
-      if (toolUseBlocks.length === 0) {
+      // Echo the model's turn back before appending results.
+      contents.push({ role: 'model', parts: candidateParts });
+
+      if (functionCalls.length === 0) {
         stepOrder += 1;
         await writeStep(runId, stepOrder, null, null, null, reasoning);
         await updateRunStatus(runId, 'completed', true);
@@ -143,21 +166,29 @@ export async function runAgentLoop(ticketId: number, runId: number): Promise<voi
         return;
       }
 
-      const toolResults: Anthropic.ToolResultBlockParam[] = [];
-      for (const block of toolUseBlocks) {
-        const result = await executeTool(block.name, block.input, runId);
-        stepOrder += 1;
-        await writeStep(runId, stepOrder, block.name, block.input, result, reasoning);
+      const responseParts: Part[] = [];
+      for (const call of functionCalls) {
+        const name = call.name ?? '';
+        const args = call.args ?? {};
+        const result = await executeTool(name, args, runId);
 
-        toolResults.push({
-          type: 'tool_result',
-          tool_use_id: block.id,
-          content: JSON.stringify(result),
-          is_error: !result.ok,
+        stepOrder += 1;
+        await writeStep(runId, stepOrder, name, args, result, reasoning);
+
+        responseParts.push({
+          functionResponse: {
+            // `id` is only populated on some backends; echo it when present so
+            // the model can match parallel calls to their results.
+            ...(call.id ? { id: call.id } : {}),
+            name,
+            // The "output"/"error" keys are the documented convention for
+            // telling the model whether the call succeeded.
+            response: result.ok ? { output: result.data } : { error: result.error },
+          },
         });
       }
 
-      messages.push({ role: 'user', content: toolResults });
+      contents.push({ role: 'user', parts: responseParts });
     }
 
     await updateRunStatus(runId, 'failed', true);
