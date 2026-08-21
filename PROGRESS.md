@@ -119,12 +119,39 @@ returns 201.
   partial copy). **Needs a fresh copy from Upstash — currently blocked on
   this.**
 
+### Switched the LLM provider: Claude → Gemini
+The agent loop was originally written against Anthropic's SDK. Switched to
+Google's Gemini free tier because the Claude API is pay-as-you-go and this is
+a student project with no budget — the free tier requires no credit card.
+`CLAUDE.md` already listed "Claude **or** Gemini" as acceptable, so this was
+a planned fork rather than scope creep.
+
+What the switch actually cost:
+- `src/agent/toolSchemas.ts` — rewritten. Anthropic uses `input_schema` +
+  `strict: true`; Gemini uses `FunctionDeclaration[]` with
+  `parametersJsonSchema`. Same JSON Schema underneath, different wrapper.
+- `src/agent/orchestrator.ts` — rewritten. The conversation model differs:
+  Anthropic returns `tool_use` content blocks and takes `tool_result` blocks
+  back; Gemini exposes `response.functionCalls` and takes `functionResponse`
+  parts, with history carried in a `contents[]` array that must echo the
+  model's own turn back verbatim.
+- **Everything else was untouched.** The three tools, the queue, the worker,
+  the schema, and the API are all provider-agnostic — they never knew which
+  LLM was calling them. That separation is why the swap was two files instead
+  of a rewrite, and it's the strongest argument for the way the tool layer
+  was factored.
+- Removed the `@anthropic-ai/sdk` dependency; added `@google/genai`.
+
+Model defaults to `gemini-2.5-flash` (free tier, highest daily request cap),
+overridable via `GEMINI_MODEL` without a code change.
+
 ### Status: blocked / pending
-- [ ] `REDIS_URL` needs a fresh token from Upstash (`WRONGPASS`)
-- [ ] `ANTHROPIC_API_KEY` not yet set — required to run the agent loop for
-      real
-- [ ] Once both are set: verify one ticket end-to-end —
-      `POST /tickets` → queued → worker picks it up → Claude calls tools →
+- [x] `REDIS_URL` — fixed with a fresh Upstash token, verified `PING → PONG`
+      plus a real set/get round trip
+- [ ] `GEMINI_API_KEY` not yet set — required to run the agent loop for real
+      (free, no card: https://aistudio.google.com/apikey)
+- [ ] Once set: verify one ticket end-to-end —
+      `POST /tickets` → queued → worker picks it up → Gemini calls tools →
       `agent_steps` rows appear → run reaches `completed`
 
 ---

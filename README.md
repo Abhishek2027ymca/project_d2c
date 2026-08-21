@@ -21,20 +21,23 @@ built, key decisions, and bugs hit along the way.
    npm install
    ```
 
-3. Copy `.env.example` to `.env` and fill in `DATABASE_URL`, `REDIS_URL`,
-   and `ANTHROPIC_API_KEY`.
+3. Get a Gemini API key (free tier, no credit card) from
+   [Google AI Studio](https://aistudio.google.com/apikey).
 
-4. Run migrations:
+4. Copy `.env.example` to `.env` and fill in `DATABASE_URL`, `REDIS_URL`,
+   and `GEMINI_API_KEY`.
+
+5. Run migrations:
    ```
    npm run db:migrate
    ```
 
-5. Seed demo data:
+6. Seed demo data:
    ```
    npm run db:seed
    ```
 
-6. Start the API and the worker (two separate processes):
+7. Start the API and the worker (two separate processes):
    ```
    npm run dev      # API
    npm run worker   # agent loop consumer
@@ -62,7 +65,7 @@ POST /tickets ──▶ tickets + agent_runs (Postgres) ──▶ BullMQ queue (
                                                      worker.ts picks up job
                                                               │
                                                               ▼
-                                          orchestrator.ts: Claude tool loop
+                                          orchestrator.ts: Gemini tool loop
                                           (lookup_order, check_refund_policy,
                                            issue_refund) — one agent_steps
                                           row per tool call, audit_log entry
