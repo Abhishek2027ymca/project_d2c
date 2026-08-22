@@ -187,11 +187,36 @@ reason — one misconfigured run shouldn't take down the consumer.
       plus a real set/get round trip
 - [x] Tools verified independently (15/15)
 - [x] Queue producer + consumer plumbing verified (6/6, plus the live run above)
-- [ ] `GEMINI_API_KEY` not yet set — the only remaining blocker
-      (free, no card: https://aistudio.google.com/apikey)
-- [ ] Once set: the real end-to-end run — Gemini actually calling
-      `lookup_order` → `check_refund_policy` → `issue_refund`, with
-      `agent_steps` rows appearing and the run reaching `completed`
+- [x] `GEMINI_API_KEY` set — see the real end-to-end run below
+
+### End-to-end run with Gemini actually calling tools
+`POST /tickets` with `{"customer_id":1,"order_id":1,"message":"This item
+arrived broken and I want a refund."}` (order 1: delivered, $49.99,
+eligible). The worker picked up job `run-2` and Gemini drove the loop with
+no scripting or forced tool order:
+
+1. `lookup_order` (order 1) → confirmed delivered, $49.99, age 0 days
+2. `check_refund_policy` (order 1) → eligible, reasons: within the 30-day
+   window and status is `delivered`
+3. `issue_refund` (order 1, $49.99, reason: "item arrived damaged") →
+   refund recorded
+4. a final no-tool step summarizing what it did and why
+
+Run reached `status: completed`. `audit_log` for the run, in order:
+`ticket_received` → `run_started` (records the model name,
+`gemini-2.5-flash`) → `refund_issued` → `run_completed`. `agent_steps` has
+one row per tool call (`step_order` 1–3) plus the closing reasoning-only
+step (4), each with `tool_called`, `input`, `output`, and `reasoning`
+populated. `amount` in every payload is a string end to end, never a float.
+
+This closes Week 2: the model chooses which tools to call and in what
+order — nothing in the orchestrator hardcodes the sequence — and every
+choice is logged immutably before, during, and after execution.
+
+**Not addressed yet, by design:** this run's refund is money-moving and
+executed immediately, with no approval step. That's the Week 3 gap —
+intercepting `issue_refund` before execution and routing it through
+`approvals` instead.
 
 ---
 

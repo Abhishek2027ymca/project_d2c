@@ -4,7 +4,7 @@ An AI agent that reads support tickets, checks order/refund data, and decides ac
 but pauses for human approval before executing money-moving actions. Every step is
 logged immutably. Retries can't double-refund.
 
-## Status: Week 2 — Agent Loop + Tool Execution (in progress)
+## Status: Week 2 — Agent Loop + Tool Execution (complete)
 
 See [PROGRESS.md](PROGRESS.md) for the full week-by-week log: what was
 built, key decisions, and bugs hit along the way.
