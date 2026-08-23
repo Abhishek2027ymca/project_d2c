@@ -6,6 +6,12 @@ export const TICKET_QUEUE_NAME = 'ticket-processing';
 export interface TicketJobData {
   ticketId: number;
   runId: number;
+  /**
+   * Present only on resume jobs. Its absence means "start this run from the
+   * top"; its presence means "this run is parked at the gate, carry on from
+   * the persisted conversation with this approval's verdict".
+   */
+  approvalId?: number;
 }
 
 export const ticketQueue = new Queue<TicketJobData>(TICKET_QUEUE_NAME, {
@@ -41,6 +47,30 @@ export async function enqueueTicket(data: TicketJobData): Promise<void> {
       `Enqueue for run ${data.runId} collided with an already-finished job ` +
         `(${jobId}, state: ${state}). The run was not queued. ` +
         `Clear stale jobs with: npm run queue:clear`,
+    );
+  }
+}
+
+/**
+ * Resume a run that a human has just approved or rejected.
+ *
+ * Keyed on the approval rather than the run: a run can hit the gate more than
+ * once, and each verdict is its own unit of work. It also makes a double-click
+ * on Approve harmless -- the second enqueue collapses onto the first job
+ * instead of resuming the run twice.
+ *
+ * The execution itself is still idempotency-keyed downstream; this is the
+ * cheaper guard that stops the duplicate before it ever reaches a worker.
+ */
+export async function enqueueApprovalResume(data: Required<TicketJobData>): Promise<void> {
+  const jobId = `approval-${data.approvalId}`;
+  const job = await ticketQueue.add('resume-run', data, { jobId });
+
+  const state = await job.getState();
+  if (state === 'completed' || state === 'failed') {
+    throw new Error(
+      `Resume for approval ${data.approvalId} collided with an already-finished ` +
+        `job (${jobId}, state: ${state}). The run was not resumed.`,
     );
   }
 }
