@@ -1,8 +1,8 @@
 import { GoogleGenAI, type Content, type Part } from '@google/genai';
 import pool from '../db/connection.js';
 import { executeTool } from './executeTool.js';
-import { TOOL_DECLARATIONS } from './toolSchemas.js';
-import type { RunStatus, Ticket } from '../types.js';
+import { MONEY_MOVING_TOOLS, TOOL_DECLARATIONS } from './toolSchemas.js';
+import type { ProposedAction, RunStatus, Ticket } from '../types.js';
 
 /**
  * Hard cap on tool-call round trips per run. Without this, a model stuck in a
@@ -86,6 +86,86 @@ async function writeStep(
   );
 }
 
+/**
+ * Everything needed to pick a paused run back up in a different process.
+ *
+ * `pendingResponses` matters when the model emits several tool calls in one
+ * turn and only a later one hits the gate: the earlier calls already executed
+ * and their results must be replayed alongside the gated one, or the model
+ * receives a turn whose tool responses do not match the calls it made.
+ */
+export interface ConversationState {
+  contents: Content[];
+  pendingResponses: Part[];
+  stepOrder: number;
+}
+
+/**
+ * Stop before a money-moving action and hand the decision to a human.
+ *
+ * Everything here is one transaction. A half-written pause -- an approval row
+ * with no status change, or a status change with no approval row -- would
+ * strand the run somewhere no code path can recover from.
+ */
+async function pauseForApproval(params: {
+  runId: number;
+  ticketId: number;
+  action: ProposedAction;
+  state: ConversationState;
+  reasoning: string | null;
+}): Promise<void> {
+  const { runId, ticketId, action, state, reasoning } = params;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const { rows } = await client.query<{ id: number }>(
+      `INSERT INTO approvals (run_id, proposed_action, status)
+       VALUES ($1, $2, 'pending')
+       RETURNING id`,
+      [runId, JSON.stringify(action)],
+    );
+    const approvalId = rows[0]!.id;
+
+    // Not terminal: completed_at stays NULL. The run is suspended, not finished,
+    // and a status of 'awaiting_approval' with an end time would be a lie.
+    await client.query(
+      `UPDATE agent_runs SET status = 'awaiting_approval', conversation_state = $1 WHERE id = $2`,
+      [JSON.stringify(state), runId],
+    );
+
+    await client.query(`UPDATE tickets SET status = 'awaiting_approval' WHERE id = $1`, [ticketId]);
+
+    // The interception is itself a step: the trace should show the agent
+    // deciding to refund and being stopped, not a gap between two tool calls.
+    await client.query(
+      `INSERT INTO agent_steps (run_id, step_order, tool_called, input, output, reasoning)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [
+        runId,
+        state.stepOrder,
+        action.tool,
+        JSON.stringify(action.args),
+        JSON.stringify({ intercepted: true, approval_id: approvalId, status: 'awaiting_approval' }),
+        reasoning,
+      ],
+    );
+
+    await client.query(
+      `INSERT INTO audit_log (run_id, event_type, payload) VALUES ($1, 'approval_requested', $2)`,
+      [runId, JSON.stringify({ approval_id: approvalId, ...action })],
+    );
+
+    await client.query('COMMIT');
+    console.log(`[run ${runId}] paused for approval ${approvalId} (${action.tool})`);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 // Constructed lazily: if GEMINI_API_KEY is missing, that failure belongs to the
 // run (marked 'failed') rather than crashing the whole worker on import.
 let genai: GoogleGenAI | null = null;
@@ -105,9 +185,9 @@ function getClient(): GoogleGenAI {
  * calls, feed the results back, repeat until it stops calling tools or the
  * iteration cap is hit.
  *
- * Week 2 scope: every tool call — including issue_refund — executes
- * immediately. The approval gate that intercepts money-moving calls before
- * execution is Week 3.
+ * Money-moving tool calls do not execute here. They suspend the run at the
+ * approval gate; a human decides, and the run resumes from persisted
+ * conversation state via resumeAgentLoop.
  */
 export async function runAgentLoop(ticketId: number, runId: number): Promise<void> {
   const ctx = await loadTicketContext(ticketId);
@@ -170,6 +250,22 @@ export async function runAgentLoop(ticketId: number, runId: number): Promise<voi
       for (const call of functionCalls) {
         const name = call.name ?? '';
         const args = call.args ?? {};
+
+        // The approval gate. Money-moving tools stop here: the run is suspended
+        // and a human decides. Note this is a check on the tool *name*, decided
+        // in our code -- not something the model can talk its way past.
+        if (MONEY_MOVING_TOOLS.has(name)) {
+          stepOrder += 1;
+          await pauseForApproval({
+            runId,
+            ticketId,
+            action: { tool: name, args, ...(call.id ? { call_id: call.id } : {}) },
+            state: { contents, pendingResponses: responseParts, stepOrder },
+            reasoning,
+          });
+          return;
+        }
+
         const result = await executeTool(name, args, { runId });
 
         stepOrder += 1;
