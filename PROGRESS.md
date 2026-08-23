@@ -4,6 +4,37 @@ Running engineering log, week by week: what was built, why, what broke, and
 how it got fixed. Kept separate from README.md — this is the working log,
 README is the pitch. Dates are IST.
 
+## Topic Index
+
+The week sections below are chronological — good for "what happened," slow
+for "why did we do X." This index is for the second question: each line
+jumps straight to the decision, wherever it lives below.
+
+**Money & correctness**
+- [Money handled as strings, never floats](#money-as-string)
+- [Refund policy re-checked at execution time, not trusted from the model](#policy-recheck)
+- [Duplicate refund blocked by a conditional UPDATE](#conditional-update)
+
+**Idempotency & the job queue**
+- [jobId keyed on the run id — a duplicate POST can't spawn two runs](#jobid-dedup)
+- [Retries are safe only because refunds are idempotency-keyed](#retry-safety)
+
+**Audit trail**
+- [audit_log is append-only at the database level, not app discipline](#audit-append-only)
+- [Ticket + run + audit row written in one transaction](#one-transaction)
+- [Enqueue runs after commit, not inside the transaction](#enqueue-after-commit)
+
+**Agent loop & tools**
+- [Tools return {ok, data} instead of throwing](#tool-result-contract)
+- [Tool schema is a contract with the model, not a security boundary](#dispatcher-revalidate)
+- [Switching LLM providers cost 2 files, not a rewrite](#provider-swap)
+
+**Testing strategy**
+- [Two smoke tests that work without an LLM key](#verification-scripts)
+- [Full plumbing proven before ever calling a real model](#plumbing-before-llm)
+
+*Week 3 will add: the approval gate, explicit idempotency keys.*
+
 ---
 
 ## Week 1 — Foundation (2026-08-18 → 2026-08-19)
@@ -12,8 +43,9 @@ README is the pitch. Dates are IST.
 - Postgres schema (`src/db/migrate.ts`): 7 tables — `customers`, `orders`,
   `tickets`, `agent_runs`, `agent_steps`, `approvals`, `audit_log`. Status
   columns are `CHECK`-constrained against the enums in `src/types.ts`, and
-  `audit_log` has Postgres `RULE`s that make `UPDATE`/`DELETE` on it silent
-  no-ops — append-only enforced by the database, not application discipline.
+  <a id="audit-append-only"></a>`audit_log` has Postgres `RULE`s that make
+  `UPDATE`/`DELETE` on it silent no-ops — append-only enforced by the
+  database, not application discipline.
 - Express API (`src/index.ts`): `GET /health`, `POST /tickets`,
   `GET /tickets/:id/trace`.
 - Seed script (`src/db/seed.ts`) — 5 customers, 10 orders, 7 tickets,
@@ -23,13 +55,14 @@ README is the pitch. Dates are IST.
   expensive conversion later.
 
 ### Key decisions
-- `orders.amount` is read back from Postgres as a **string**, typed that way
-  on purpose (`src/types.ts`) — `pg` returns `DECIMAL` columns as strings to
-  avoid float rounding on money. Casting straight to `Number` anywhere in the
-  refund path is how a ₹0.01 discrepancy gets in.
-- Ticket + `agent_runs` row + `ticket_received` audit log entry are written
-  in one transaction (`POST /tickets`). A ticket with no run would sit
-  invisible to the worker forever.
+- <a id="money-as-string"></a>`orders.amount` is read back from Postgres as
+  a **string**, typed that way on purpose (`src/types.ts`) — `pg` returns
+  `DECIMAL` columns as strings to avoid float rounding on money. Casting
+  straight to `Number` anywhere in the refund path is how a ₹0.01
+  discrepancy gets in.
+- <a id="one-transaction"></a>Ticket + `agent_runs` row + `ticket_received`
+  audit log entry are written in one transaction (`POST /tickets`). A ticket
+  with no run would sit invisible to the worker forever.
 - Docker Desktop wasn't working on this machine, so local Postgres moved to
   **Neon** (hosted, free tier) instead of `docker-compose up`. Same
   `DATABASE_URL` pattern this project would use in production anyway, so
@@ -59,13 +92,13 @@ returns 201.
   `issueRefund`.
 - Tool schemas for Claude (`src/agent/toolSchemas.ts`) — `strict: true` +
   `additionalProperties: false` so tool-call arguments validate exactly.
-- Tool dispatcher (`src/agent/executeTool.ts`) — re-validates input even
-  though the schemas are strict, because the schema is a contract with the
-  model, not a security boundary; this is where untrusted input actually
-  enters real code.
-- BullMQ ticket queue + Redis connection (`src/queue/`) — `jobId` is keyed on
-  the run id (`run-${runId}`), so a duplicate `POST /tickets` can't spawn two
-  runs for the same run record.
+- <a id="dispatcher-revalidate"></a>Tool dispatcher (`src/agent/executeTool.ts`)
+  — re-validates input even though the schemas are strict, because the
+  schema is a contract with the model, not a security boundary; this is
+  where untrusted input actually enters real code.
+- <a id="jobid-dedup"></a>BullMQ ticket queue + Redis connection
+  (`src/queue/`) — `jobId` is keyed on the run id (`run-${runId}`), so a
+  duplicate `POST /tickets` can't spawn two runs for the same run record.
 - **Agent orchestrator** (`src/agent/orchestrator.ts`) — the actual Claude
   tool-calling loop: load the ticket, call Claude with the 3 tool schemas,
   execute whatever it calls via the dispatcher, write one `agent_steps` row
@@ -79,28 +112,31 @@ returns 201.
   new tickets.
 
 ### Key decisions
-- **Week 2 executes every tool immediately, including `issue_refund`.** The
-  approval gate that intercepts money-moving calls *before* execution is
-  explicitly Week 3 scope — not bolted on early, so the agent loop itself
-  gets proven correct first.
-- `issueRefund`'s `UPDATE` is conditional
+- <a id="retry-safety"></a>**Week 2 executes every tool immediately,
+  including `issue_refund`.** The approval gate that intercepts
+  money-moving calls *before* execution is explicitly Week 3 scope — not
+  bolted on early, so the agent loop itself gets proven correct first.
+- <a id="conditional-update"></a>`issueRefund`'s `UPDATE` is conditional
   (`WHERE id = $1 AND status <> 'refunded'`), so two concurrent calls can't
   both succeed — the second matches zero rows. The database enforces
   single-execution here; explicit idempotency keys are a Week 3 addition on
   top of this, not a replacement for it.
-- Tools return `{ ok, data }` / `{ ok: false, error }` instead of throwing
-  (`src/tools/types.ts`). A failed tool result is fed back to the model,
-  which can reason about it ("order not found — ask the customer to confirm
-  the order number") instead of the whole run dying on an exception.
-- Refund policy is **re-checked inside `issueRefund` itself**, not trusted
-  from the model's earlier `check_refund_policy` call. The model could
-  hallucinate eligibility, or order state could change between the check and
-  the execution — the gate that matters is the one at the point of
-  execution, not the one earlier in the conversation.
-- `enqueueTicket` runs *after* the DB transaction commits, not inside it.
-  The ticket/run rows are the source of truth; if Redis is unreachable the
-  ticket still exists (recorded as an `enqueue_failed` audit_log entry)
-  instead of vanishing because a queue write failed.
+- <a id="tool-result-contract"></a>Tools return `{ ok, data }` /
+  `{ ok: false, error }` instead of throwing (`src/tools/types.ts`). A
+  failed tool result is fed back to the model, which can reason about it
+  ("order not found — ask the customer to confirm the order number")
+  instead of the whole run dying on an exception.
+- <a id="policy-recheck"></a>Refund policy is **re-checked inside
+  `issueRefund` itself**, not trusted from the model's earlier
+  `check_refund_policy` call. The model could hallucinate eligibility, or
+  order state could change between the check and the execution — the gate
+  that matters is the one at the point of execution, not the one earlier in
+  the conversation.
+- <a id="enqueue-after-commit"></a>`enqueueTicket` runs *after* the DB
+  transaction commits, not inside it. The ticket/run rows are the source of
+  truth; if Redis is unreachable the ticket still exists (recorded as an
+  `enqueue_failed` audit_log entry) instead of vanishing because a queue
+  write failed.
 
 ### Bugs hit
 - **`.env` got corrupted by a paste that duplicated the whole template**
@@ -119,6 +155,7 @@ returns 201.
   partial copy). **Needs a fresh copy from Upstash — currently blocked on
   this.**
 
+<a id="provider-swap"></a>
 ### Switched the LLM provider: Claude → Gemini
 The agent loop was originally written against Anthropic's SDK. Switched to
 Google's Gemini free tier because the Claude API is pay-as-you-go and this is
@@ -145,6 +182,7 @@ What the switch actually cost:
 Model defaults to `gemini-2.5-flash` (free tier, highest daily request cap),
 overridable via `GEMINI_MODEL` without a code change.
 
+<a id="verification-scripts"></a>
 ### Verification scripts
 Two runnable smoke tests, both of which work without an LLM key. They exist
 so that when the agent later does something unexpected, the first question —
@@ -166,6 +204,7 @@ directly against Postgres:
 - job id derivation, payload shape, retry config
 - cleans up its own scratch job, safe against a live queue
 
+<a id="plumbing-before-llm"></a>
 ### End-to-end plumbing verified (without the LLM)
 Ran the whole path with `GEMINI_API_KEY` deliberately unset:
 `POST /tickets` → row in Postgres → job `run-1` in Redis with the right
