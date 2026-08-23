@@ -2,6 +2,7 @@ import express, { type Request, type Response } from 'express';
 import 'dotenv/config';
 import pool from './db/connection.js';
 import { enqueueApprovalResume, enqueueTicket } from './queue/ticketQueue.js';
+import { decideApproval } from './approvals/decide.js';
 import type { AgentRun, AgentStep, Approval, Ticket } from './types.js';
 
 const app = express();
@@ -149,110 +150,78 @@ app.get('/approvals', async (_req: Request, res: Response) => {
 });
 
 /**
- * Record a human verdict on a proposed action and let the run continue.
+ * Record a human verdict and let the run continue.
  *
- * The status transition is a conditional UPDATE on `status = 'pending'`, so it
- * is the database that decides who wins a race. Two reviewers hitting Approve
- * at the same moment, or one reviewer double-clicking, produce exactly one
- * state change; everyone else gets a 409. Checking first and then updating
- * would leave a window where both callers believe they won.
+ * The state machine lives in src/approvals/decide.ts; this maps its outcome
+ * onto status codes. 404 and 409 stay distinct — "no such approval" and
+ * "already decided" are different problems for whoever is looking at the
+ * dashboard.
  */
-async function decideApproval(
+async function handleDecision(
   req: Request,
   res: Response,
   decision: 'approved' | 'rejected',
 ): Promise<void> {
-  const approvalId = Number(req.params.id);
-  if (!Number.isInteger(approvalId) || approvalId <= 0) {
-    res.status(400).json({ error: 'approval id must be a positive integer' });
-    return;
-  }
-
   const { reviewed_by, reason } = req.body ?? {};
-  if (typeof reviewed_by !== 'string' || reviewed_by.trim() === '') {
-    res.status(400).json({ error: 'reviewed_by (non-empty string) is required' });
-    return;
-  }
-  // A rejection that doesn't say why is useless to the customer and to the
-  // model, which has to explain the outcome in its closing message.
-  if (decision === 'rejected' && (typeof reason !== 'string' || reason.trim() === '')) {
-    res.status(400).json({ error: 'reason (non-empty string) is required when rejecting' });
-    return;
-  }
 
-  const client = await pool.connect();
   try {
-    await client.query('BEGIN');
+    const outcome = await decideApproval({
+      approvalId: Number(req.params.id),
+      decision,
+      reviewedBy: reviewed_by,
+      reason,
+    });
 
-    const { rows } = await client.query<{ run_id: number; ticket_id: number }>(
-      `UPDATE approvals a
-          SET status = $1, reviewed_by = $2, reason = $3, reviewed_at = NOW()
-         FROM agent_runs r
-        WHERE a.id = $4 AND a.status = 'pending' AND r.id = a.run_id
-    RETURNING a.run_id, r.ticket_id`,
-      [decision, reviewed_by, reason ?? null, approvalId],
-    );
-
-    if (rows.length === 0) {
-      await client.query('ROLLBACK');
-      const { rows: existing } = await pool.query<{ status: string }>(
-        'SELECT status FROM approvals WHERE id = $1',
-        [approvalId],
-      );
-      if (existing.length === 0) {
+    if (!outcome.ok) {
+      if (outcome.code === 'invalid') {
+        res.status(400).json({ error: outcome.message });
+      } else if (outcome.code === 'not_found') {
         res.status(404).json({ error: 'Approval not found' });
       } else {
         res.status(409).json({
-          error: `Approval ${approvalId} was already ${existing[0]!.status}`,
-          status: existing[0]!.status,
+          error: `Approval ${req.params.id} was already ${outcome.status}`,
+          status: outcome.status,
         });
       }
       return;
     }
 
-    const { run_id: runId, ticket_id: ticketId } = rows[0]!;
-
-    await client.query(
-      `INSERT INTO audit_log (run_id, event_type, payload) VALUES ($1, $2, $3)`,
-      [
-        runId,
-        decision === 'approved' ? 'approval_granted' : 'approval_rejected',
-        JSON.stringify({ approval_id: approvalId, reviewed_by, reason: reason ?? null }),
-      ],
-    );
-
-    await client.query('COMMIT');
-
-    // Queued after commit, for the same reason ticket ingestion is: the verdict
-    // is the source of truth. If Redis is unreachable the decision still stands
-    // and the run can be requeued, rather than the approval being lost because
-    // a queue write failed.
+    // Queued after the verdict is committed, for the same reason ticket
+    // ingestion is: the decision is the source of truth. If Redis is
+    // unreachable the decision still stands and can be requeued, rather than
+    // being lost because a queue write failed.
     try {
-      await enqueueApprovalResume({ ticketId, runId, approvalId });
+      await enqueueApprovalResume({
+        ticketId: outcome.ticketId,
+        runId: outcome.runId,
+        approvalId: outcome.approvalId,
+      });
     } catch (queueErr) {
-      console.error(`Failed to enqueue resume for approval ${approvalId}:`, queueErr);
+      console.error(`Failed to enqueue resume for approval ${outcome.approvalId}:`, queueErr);
       await pool.query('INSERT INTO audit_log (run_id, event_type, payload) VALUES ($1, $2, $3)', [
-        runId,
+        outcome.runId,
         'enqueue_failed',
         JSON.stringify({
-          approval_id: approvalId,
+          approval_id: outcome.approvalId,
           error: queueErr instanceof Error ? queueErr.message : String(queueErr),
         }),
       ]);
     }
 
-    res.json({ approval_id: approvalId, status: decision, run_id: runId, resumed: true });
+    res.json({
+      approval_id: outcome.approvalId,
+      status: outcome.decision,
+      run_id: outcome.runId,
+      resumed: true,
+    });
   } catch (err) {
-    await client.query('ROLLBACK');
-    console.error(`POST /approvals/${approvalId}/${decision} failed:`, err);
+    console.error(`POST /approvals/${req.params.id}/${decision} failed:`, err);
     res.status(500).json({ error: 'Failed to record decision' });
-  } finally {
-    client.release();
   }
 }
 
-app.post('/approvals/:id/approve', (req, res) => decideApproval(req, res, 'approved'));
-app.post('/approvals/:id/reject', (req, res) => decideApproval(req, res, 'rejected'));
+app.post('/approvals/:id/approve', (req, res) => handleDecision(req, res, 'approved'));
+app.post('/approvals/:id/reject', (req, res) => handleDecision(req, res, 'rejected'));
 
 app.listen(PORT, () => {
   console.log(`✓ API listening on http://localhost:${PORT}`);

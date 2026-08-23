@@ -14,7 +14,8 @@
     "db:seed": "tsx src/db/seed.ts",
     "verify:tools": "tsx src/scripts/verifyTools.ts",
     "verify:queue": "tsx src/scripts/verifyQueue.ts",
-    "queue:clear": "tsx src/scripts/clearQueue.ts"
+    "queue:clear": "tsx src/scripts/clearQueue.ts",
+    "verify:approvals": "tsx src/scripts/verifyApprovals.ts"
   },
   "keywords": [],
   "author": "Abhishek Singh",
