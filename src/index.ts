@@ -1,7 +1,7 @@
 import express, { type Request, type Response } from 'express';
 import 'dotenv/config';
 import pool from './db/connection.js';
-import { enqueueTicket } from './queue/ticketQueue.js';
+import { enqueueApprovalResume, enqueueTicket } from './queue/ticketQueue.js';
 import type { AgentRun, AgentStep, Approval, Ticket } from './types.js';
 
 const app = express();
@@ -128,6 +128,131 @@ app.get('/tickets/:id/trace', async (req: Request, res: Response) => {
     res.status(500).json({ error: 'Failed to fetch trace' });
   }
 });
+
+/** The review queue: every action waiting on a human, oldest first. */
+app.get('/approvals', async (_req: Request, res: Response) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT a.id, a.run_id, a.proposed_action, a.status, a.created_at,
+              r.ticket_id, t.message AS ticket_message, t.customer_id
+         FROM approvals a
+         JOIN agent_runs r ON r.id = a.run_id
+         JOIN tickets t    ON t.id = r.ticket_id
+        WHERE a.status = 'pending'
+        ORDER BY a.created_at`,
+    );
+    res.json({ pending: rows });
+  } catch (err) {
+    console.error('GET /approvals failed:', err);
+    res.status(500).json({ error: 'Failed to list approvals' });
+  }
+});
+
+/**
+ * Record a human verdict on a proposed action and let the run continue.
+ *
+ * The status transition is a conditional UPDATE on `status = 'pending'`, so it
+ * is the database that decides who wins a race. Two reviewers hitting Approve
+ * at the same moment, or one reviewer double-clicking, produce exactly one
+ * state change; everyone else gets a 409. Checking first and then updating
+ * would leave a window where both callers believe they won.
+ */
+async function decideApproval(
+  req: Request,
+  res: Response,
+  decision: 'approved' | 'rejected',
+): Promise<void> {
+  const approvalId = Number(req.params.id);
+  if (!Number.isInteger(approvalId) || approvalId <= 0) {
+    res.status(400).json({ error: 'approval id must be a positive integer' });
+    return;
+  }
+
+  const { reviewed_by, reason } = req.body ?? {};
+  if (typeof reviewed_by !== 'string' || reviewed_by.trim() === '') {
+    res.status(400).json({ error: 'reviewed_by (non-empty string) is required' });
+    return;
+  }
+  // A rejection that doesn't say why is useless to the customer and to the
+  // model, which has to explain the outcome in its closing message.
+  if (decision === 'rejected' && (typeof reason !== 'string' || reason.trim() === '')) {
+    res.status(400).json({ error: 'reason (non-empty string) is required when rejecting' });
+    return;
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const { rows } = await client.query<{ run_id: number; ticket_id: number }>(
+      `UPDATE approvals a
+          SET status = $1, reviewed_by = $2, reason = $3, reviewed_at = NOW()
+         FROM agent_runs r
+        WHERE a.id = $4 AND a.status = 'pending' AND r.id = a.run_id
+    RETURNING a.run_id, r.ticket_id`,
+      [decision, reviewed_by, reason ?? null, approvalId],
+    );
+
+    if (rows.length === 0) {
+      await client.query('ROLLBACK');
+      const { rows: existing } = await pool.query<{ status: string }>(
+        'SELECT status FROM approvals WHERE id = $1',
+        [approvalId],
+      );
+      if (existing.length === 0) {
+        res.status(404).json({ error: 'Approval not found' });
+      } else {
+        res.status(409).json({
+          error: `Approval ${approvalId} was already ${existing[0]!.status}`,
+          status: existing[0]!.status,
+        });
+      }
+      return;
+    }
+
+    const { run_id: runId, ticket_id: ticketId } = rows[0]!;
+
+    await client.query(
+      `INSERT INTO audit_log (run_id, event_type, payload) VALUES ($1, $2, $3)`,
+      [
+        runId,
+        decision === 'approved' ? 'approval_granted' : 'approval_rejected',
+        JSON.stringify({ approval_id: approvalId, reviewed_by, reason: reason ?? null }),
+      ],
+    );
+
+    await client.query('COMMIT');
+
+    // Queued after commit, for the same reason ticket ingestion is: the verdict
+    // is the source of truth. If Redis is unreachable the decision still stands
+    // and the run can be requeued, rather than the approval being lost because
+    // a queue write failed.
+    try {
+      await enqueueApprovalResume({ ticketId, runId, approvalId });
+    } catch (queueErr) {
+      console.error(`Failed to enqueue resume for approval ${approvalId}:`, queueErr);
+      await pool.query('INSERT INTO audit_log (run_id, event_type, payload) VALUES ($1, $2, $3)', [
+        runId,
+        'enqueue_failed',
+        JSON.stringify({
+          approval_id: approvalId,
+          error: queueErr instanceof Error ? queueErr.message : String(queueErr),
+        }),
+      ]);
+    }
+
+    res.json({ approval_id: approvalId, status: decision, run_id: runId, resumed: true });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(`POST /approvals/${approvalId}/${decision} failed:`, err);
+    res.status(500).json({ error: 'Failed to record decision' });
+  } finally {
+    client.release();
+  }
+}
+
+app.post('/approvals/:id/approve', (req, res) => decideApproval(req, res, 'approved'));
+app.post('/approvals/:id/reject', (req, res) => decideApproval(req, res, 'rejected'));
 
 app.listen(PORT, () => {
   console.log(`✓ API listening on http://localhost:${PORT}`);
