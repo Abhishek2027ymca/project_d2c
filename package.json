@@ -13,7 +13,8 @@
     "db:migrate": "tsx src/db/migrate.ts",
     "db:seed": "tsx src/db/seed.ts",
     "verify:tools": "tsx src/scripts/verifyTools.ts",
-    "verify:queue": "tsx src/scripts/verifyQueue.ts"
+    "verify:queue": "tsx src/scripts/verifyQueue.ts",
+    "queue:clear": "tsx src/scripts/clearQueue.ts"
   },
   "keywords": [],
   "author": "Abhishek Singh",
