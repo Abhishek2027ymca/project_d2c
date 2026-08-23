@@ -58,6 +58,30 @@ CREATE TABLE IF NOT EXISTS approvals (
   reviewed_at     TIMESTAMPTZ
 );
 
+-- Every refund that actually executed, keyed by an idempotency key supplied by
+-- the caller. The UNIQUE constraint is what makes a retry safe: the second
+-- attempt collides instead of paying out again, and returns the stored result
+-- of the first -- a retry of a succeeded operation is a success, not an error.
+-- The result column stays NULL until the money actually moves, so a row that
+-- exists with no result is a crashed attempt rather than a completed one.
+CREATE TABLE IF NOT EXISTS refunds (
+  id              SERIAL PRIMARY KEY,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  run_id          INT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+  order_id        INT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+  amount          DECIMAL(10,2) NOT NULL CHECK (amount > 0),
+  reason          TEXT NOT NULL,
+  result          JSONB,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Added after the initial schema shipped, so these run as ALTERs rather than
+-- being folded into CREATE TABLE above -- CREATE TABLE IF NOT EXISTS is a no-op
+-- on an existing table and would silently skip new columns.
+ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS conversation_state JSONB;
+ALTER TABLE approvals  ADD COLUMN IF NOT EXISTS reason TEXT;
+ALTER TABLE approvals  ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
 -- Append-only. Nothing in the app may ever UPDATE or DELETE a row here;
 -- the rules below make the database enforce that, not just convention.
 CREATE TABLE IF NOT EXISTS audit_log (
@@ -79,6 +103,8 @@ CREATE INDEX IF NOT EXISTS idx_agent_steps_run     ON agent_steps(run_id, step_o
 CREATE INDEX IF NOT EXISTS idx_approvals_run       ON approvals(run_id);
 CREATE INDEX IF NOT EXISTS idx_approvals_pending   ON approvals(status) WHERE status = 'pending';
 CREATE INDEX IF NOT EXISTS idx_audit_run           ON audit_log(run_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_refunds_run         ON refunds(run_id);
+CREATE INDEX IF NOT EXISTS idx_refunds_order       ON refunds(order_id);
 `;
 
 async function migrate(): Promise<void> {
