@@ -107,11 +107,16 @@ async function main(): Promise<void> {
   console.log('\nissue_refund');
   const amount = Number(delivered.amount);
 
+  // Keys are scoped to this scratch run so a re-run of the script performs a
+  // genuinely new refund instead of replaying the previous run's stored result.
+  const key = (suffix: string) => `verify-${runId}-${suffix}`;
+
   const overAmount = await issueRefund({
     orderId: delivered.id,
     amount: amount + 100,
     reason: 'over-refund attempt',
     runId,
+    idempotencyKey: key('over'),
   });
   check('refuses an amount above the order total', !overAmount.ok, summarize(overAmount));
 
@@ -120,6 +125,7 @@ async function main(): Promise<void> {
     amount: -5,
     reason: 'negative amount',
     runId,
+    idempotencyKey: key('negative'),
   });
   check('refuses a negative amount', !negative.ok, summarize(negative));
 
@@ -128,14 +134,25 @@ async function main(): Promise<void> {
     amount,
     reason: '   ',
     runId,
+    idempotencyKey: key('no-reason'),
   });
   check('refuses a blank reason', !noReason.ok, summarize(noReason));
+
+  const noKey = await issueRefund({
+    orderId: delivered.id,
+    amount,
+    reason: 'missing idempotency key',
+    runId,
+    idempotencyKey: '',
+  });
+  check('refuses to move money without an idempotency key', !noKey.ok, summarize(noKey));
 
   const ineligible = await issueRefund({
     orderId: cancelled.id,
     amount: 1,
     reason: 'should be blocked by policy',
     runId,
+    idempotencyKey: key('ineligible'),
   });
   check(
     're-checks policy at execution time and blocks an ineligible order',
@@ -148,17 +165,52 @@ async function main(): Promise<void> {
     amount,
     reason: 'verifyTools: legitimate refund',
     runId,
+    idempotencyKey: key('legit'),
   });
   check('issues a valid refund', first.ok, summarize(first));
 
-  // The core safety property: a retry must not pay out twice.
+  // The property idempotency keys add over the conditional UPDATE: replaying the
+  // *same* logical refund is a success that returns the original result, not an
+  // error. A caller retrying after a timeout needs to hear "this already
+  // happened, here is what happened" -- not "denied".
+  const replay = await issueRefund({
+    orderId: delivered.id,
+    amount,
+    reason: 'verifyTools: legitimate refund',
+    runId,
+    idempotencyKey: key('legit'),
+  });
+  check('replaying the same idempotency key succeeds', replay.ok, summarize(replay));
+  // Compared field by field rather than by JSON.stringify: JSONB is not JSON.
+  // Postgres normalizes object key order on storage (shortest key first, then
+  // bytewise), so the round-tripped result is value-identical but serializes in
+  // a different order than the object that went in.
+  check(
+    'the replay returns the original result, not a fresh one',
+    first.ok &&
+      replay.ok &&
+      first.data.order_id === replay.data.order_id &&
+      first.data.refunded_amount === replay.data.refunded_amount &&
+      first.data.reason === replay.data.reason &&
+      first.data.refunded_at === replay.data.refunded_at,
+    `first=${JSON.stringify(first.ok && first.data)} replay=${JSON.stringify(replay.ok && replay.data)}`,
+  );
+
+  // A *different* logical refund against an already-refunded order is a genuine
+  // error. This is the case an idempotency key cannot see, and the reason the
+  // conditional UPDATE stays in place alongside it.
   const second = await issueRefund({
     orderId: delivered.id,
     amount,
     reason: 'verifyTools: duplicate attempt',
     runId,
+    idempotencyKey: key('duplicate'),
   });
-  check('a second refund on the same order is rejected', !second.ok, summarize(second));
+  check(
+    'a different refund on an already-refunded order is rejected',
+    !second.ok,
+    summarize(second),
+  );
 
   const { rows: auditRows } = await pool.query<{ count: string }>(
     `SELECT COUNT(*) AS count FROM audit_log
@@ -169,6 +221,16 @@ async function main(): Promise<void> {
     'exactly one refund_issued audit entry was written',
     auditRows[0]!.count === '1',
     `found ${auditRows[0]!.count}`,
+  );
+
+  const { rows: paidRows } = await pool.query<{ count: string }>(
+    `SELECT COUNT(*) AS count FROM refunds WHERE run_id = $1 AND result IS NOT NULL`,
+    [runId],
+  );
+  check(
+    'exactly one refund row actually paid out',
+    paidRows[0]!.count === '1',
+    `found ${paidRows[0]!.count}`,
   );
 
   console.log(`\n${passed} passed, ${failed} failed`);

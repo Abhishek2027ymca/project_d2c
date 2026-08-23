@@ -3,6 +3,17 @@ import { checkRefundPolicy } from '../tools/checkRefundPolicy.js';
 import { issueRefund } from '../tools/issueRefund.js';
 import { fail, type ToolResult } from '../tools/types.js';
 
+export interface ExecuteToolContext {
+  runId: number;
+  /**
+   * Required before a money-moving tool will run. Supplied by the approval
+   * resume path (derived from the approval id), never invented here — the key
+   * has to be stable across retries, and only the caller knows what "the same
+   * refund" means in its context.
+   */
+  idempotencyKey?: string;
+}
+
 /**
  * Maps a tool name from the model onto the real function.
  *
@@ -13,7 +24,7 @@ import { fail, type ToolResult } from '../tools/types.js';
 export async function executeTool(
   name: string,
   input: unknown,
-  runId: number,
+  ctx: ExecuteToolContext,
 ): Promise<ToolResult<unknown>> {
   const args = (input ?? {}) as Record<string, unknown>;
 
@@ -24,13 +35,20 @@ export async function executeTool(
     case 'check_refund_policy':
       return checkRefundPolicy(Number(args.order_id));
 
-    case 'issue_refund':
+    case 'issue_refund': {
+      // Reaching here without a key means something bypassed the approval gate.
+      // Refuse rather than mint one, which would silently defeat idempotency.
+      if (!ctx.idempotencyKey) {
+        return fail('issue_refund requires an approved action with an idempotency key');
+      }
       return issueRefund({
         orderId: Number(args.order_id),
         amount: Number(args.amount),
         reason: String(args.reason ?? ''),
-        runId,
+        runId: ctx.runId,
+        idempotencyKey: ctx.idempotencyKey,
       });
+    }
 
     default:
       return fail(`Unknown tool: ${name}`);

@@ -170,7 +170,7 @@ export async function runAgentLoop(ticketId: number, runId: number): Promise<voi
       for (const call of functionCalls) {
         const name = call.name ?? '';
         const args = call.args ?? {};
-        const result = await executeTool(name, args, runId);
+        const result = await executeTool(name, args, { runId });
 
         stepOrder += 1;
         await writeStep(runId, stepOrder, name, args, result, reasoning);
