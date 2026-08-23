@@ -13,18 +13,24 @@ const worker = new Worker<TicketJobData>(
     // the gate and a human has ruled on it; its absence means start from the top.
     if (approvalId !== undefined) {
       console.log(`↻ resuming run ${runId} after approval ${approvalId}`);
-      await resumeAgentLoop(runId, approvalId);
-      return;
+      return resumeAgentLoop(runId, approvalId);
     }
 
     console.log(`→ run ${runId} (ticket ${ticketId})`);
-    await runAgentLoop(ticketId, runId);
+    return runAgentLoop(ticketId, runId);
   },
   { connection: redisConnection, concurrency: 2 },
 );
 
-worker.on('completed', (job) => {
-  console.log(`✓ run ${job.data.runId} completed`);
+// A job finishing and a run finishing are different events: pausing at the
+// approval gate is a perfectly successful job whose run is not done. Logging
+// the returned run status keeps the two from being read as the same thing.
+worker.on('completed', (job, status) => {
+  if (status === 'awaiting_approval') {
+    console.log(`⏸ run ${job.data.runId} paused, waiting on a human`);
+  } else {
+    console.log(`✓ run ${job.data.runId} ${status}`);
+  }
 });
 
 worker.on('failed', (job, err) => {

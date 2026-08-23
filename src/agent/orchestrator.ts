@@ -198,7 +198,7 @@ async function driveLoop(params: {
   contents: Content[];
   stepOrder: number;
   ticketOutcome: TicketStatus;
-}): Promise<void> {
+}): Promise<RunStatus> {
   const { ticketId, runId, contents, ticketOutcome } = params;
   let stepOrder = params.stepOrder;
 
@@ -231,7 +231,7 @@ async function driveLoop(params: {
         await updateRunStatus(runId, 'completed', true);
         await updateTicketStatus(ticketId, ticketOutcome);
         await writeAuditLog(runId, 'run_completed', { reasoning });
-        return;
+        return 'completed';
       }
 
       const responseParts: Part[] = [];
@@ -251,7 +251,7 @@ async function driveLoop(params: {
             state: { contents, pendingResponses: responseParts, stepOrder },
             reasoning,
           });
-          return;
+          return 'awaiting_approval';
         }
 
         const result = await executeTool(name, args, { runId });
@@ -280,6 +280,7 @@ async function driveLoop(params: {
     await writeAuditLog(runId, 'run_failed', {
       reason: `Exceeded ${MAX_ITERATIONS} tool-call iterations without reaching a conclusion`,
     });
+    return 'failed';
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     await updateRunStatus(runId, 'failed', true);
@@ -301,7 +302,7 @@ async function driveLoop(params: {
  * approval gate; a human decides, and the run resumes from persisted
  * conversation state via resumeAgentLoop.
  */
-export async function runAgentLoop(ticketId: number, runId: number): Promise<void> {
+export async function runAgentLoop(ticketId: number, runId: number): Promise<RunStatus> {
   const ctx = await loadTicketContext(ticketId);
 
   await updateRunStatus(runId, 'running', false);
@@ -326,7 +327,7 @@ export async function runAgentLoop(ticketId: number, runId: number): Promise<voi
     },
   ];
 
-  await driveLoop({ ticketId, runId, contents, stepOrder: 0, ticketOutcome: 'resolved' });
+  return driveLoop({ ticketId, runId, contents, stepOrder: 0, ticketOutcome: 'resolved' });
 }
 
 /**
@@ -337,7 +338,7 @@ export async function runAgentLoop(ticketId: number, runId: number): Promise<voi
  * order, a specific amount -- and re-prompting could return something else.
  * What was approved is what runs.
  */
-export async function resumeAgentLoop(runId: number, approvalId: number): Promise<void> {
+export async function resumeAgentLoop(runId: number, approvalId: number): Promise<RunStatus> {
   const { rows: runRows } = await pool.query<{
     ticket_id: number;
     status: RunStatus;
@@ -441,7 +442,7 @@ export async function resumeAgentLoop(runId: number, approvalId: number): Promis
   // stale resume replay a decision that has already been applied.
   await pool.query('UPDATE agent_runs SET conversation_state = NULL WHERE id = $1', [runId]);
 
-  await driveLoop({
+  return driveLoop({
     ticketId,
     runId,
     contents,
