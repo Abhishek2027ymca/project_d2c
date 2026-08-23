@@ -10,12 +10,23 @@ The week sections below are chronological — good for "what happened," slow
 for "why did we do X." This index is for the second question: each line
 jumps straight to the decision, wherever it lives below.
 
+**The approval gate** (the point of the project)
+- [Money-moving actions stop and wait for a human](#approval-gate)
+- [The gate keys off the tool name, not the model's self-report](#gate-on-tool-name)
+- [What was approved is what runs — never a re-asked action](#approved-action-executes)
+- [A paused run survives the worker dying](#durable-pause)
+- [One verdict per approval, enforced by a conditional UPDATE](#verdict-race)
+
 **Money & correctness**
 - [Money handled as strings, never floats](#money-as-string)
 - [Refund policy re-checked at execution time, not trusted from the model](#policy-recheck)
 - [Duplicate refund blocked by a conditional UPDATE](#conditional-update)
 
 **Idempotency & the job queue**
+- [The idempotency key is the approval id](#key-is-approval)
+- [A retry of a succeeded refund is a success, not an error](#retry-returns-original)
+- [Policy is re-checked after the key is claimed, not before](#claim-before-check)
+- [ON CONFLICT DO UPDATE, not DO NOTHING — it takes the row lock](#conflict-do-update)
 - [jobId keyed on the run id — a duplicate POST can't spawn two runs](#jobid-dedup)
 - [Retries are safe only because refunds are idempotency-keyed](#retry-safety)
 
@@ -33,7 +44,11 @@ jumps straight to the decision, wherever it lives below.
 - [Two smoke tests that work without an LLM key](#verification-scripts)
 - [Full plumbing proven before ever calling a real model](#plumbing-before-llm)
 
-*Week 3 will add: the approval gate, explicit idempotency keys.*
+**Bugs worth retelling**
+- [A ticket returned 201 and then silently never ran](#jobid-collision)
+- [A test failed because JSONB is not JSON](#jsonb-key-order)
+
+*Week 4 will add: the trace viewer, deploy, the case-study README.*
 
 ---
 
@@ -259,9 +274,149 @@ intercepting `issue_refund` before execution and routing it through
 
 ---
 
-## Next — Week 3: Approval Gate + Idempotent Execution
-- Intercept `issue_refund` before execution: write to `approvals` instead of
-  running it immediately, set the run to `awaiting_approval`.
-- `POST /approvals/:id/approve` and `/reject` to resume a paused run.
-- Explicit idempotency keys on the refund execution path, on top of the
-  conditional-`UPDATE` guard already in place.
+## Week 3 — Approval Gate + Idempotent Execution (2026-08-23)
+
+The week the project stopped being "an agent that calls tools" and became
+"an agent that isn't allowed to move money on its own."
+
+### Built
+- <a id="approval-gate"></a>**The approval gate** (`src/agent/orchestrator.ts`)
+  — money-moving tool calls no longer execute. The run suspends: an
+  `approvals` row records the exact proposed action, the conversation is
+  persisted, and run + ticket both move to `awaiting_approval`.
+- <a id="durable-pause"></a>**Durable pause/resume** — `agent_runs.conversation_state`
+  holds the model conversation, so a *different* worker process can pick the
+  run back up mid-thought. The pause survives the worker dying.
+- <a id="refunds-table"></a>**`refunds` table** with a UNIQUE `idempotency_key`,
+  and `issueRefund` rewritten around it.
+- **Approval endpoints** — `GET /approvals` (the review queue),
+  `POST /approvals/:id/approve`, `POST /approvals/:id/reject`.
+- Decision state machine extracted to `src/approvals/decide.ts` so the code
+  that decides whether money may move is testable without HTTP.
+- Ticket status wired through the lifecycle — nothing had been setting it:
+  `processing` → `awaiting_approval` → `resolved`/`rejected`, back to `open`
+  if the run fails.
+- `npm run queue:clear`, and `npm run verify:approvals` (12 checks).
+
+### Key decisions
+- <a id="gate-on-tool-name"></a>**The gate keys off the tool name, decided in
+  our code — not off anything the model reports about itself.** A model that
+  has been talked into refunding still cannot execute; it can only ever
+  *request*. Any design where the model asserts its own confidence or
+  risk level is one prompt injection away from being no gate at all.
+- <a id="approved-action-executes"></a>**What was approved is what runs.** On
+  resume the action executed is the one stored on the approval row, not a
+  fresh one asked of the model. A human approved a specific order and a
+  specific amount; re-prompting could return something else, and the
+  approval would then be authorising an action nobody reviewed.
+- <a id="key-is-approval"></a>**The idempotency key is `approval-${id}`** —
+  one human decision authorises exactly one payout, however many times the
+  job is retried or redelivered. This is why `verify:approvals` cares so much
+  that an approval can only be decided once: if a verdict could be recorded
+  twice, the key derived from it would stop meaning what it claims to.
+- <a id="retry-returns-original"></a>**A retry of a succeeded refund is a
+  success, not an error.** The conditional `UPDATE` already prevented double
+  payment, but it could only ever answer "no rows matched" — so a caller
+  retrying after a timeout was told its refund was *denied* when in fact it
+  had gone through. Prevention was right; the reported outcome was wrong.
+  Replaying an idempotency key now returns the stored result of the original
+  attempt.
+- <a id="claim-before-check"></a>**Policy is re-checked *after* the key is
+  claimed, not before.** A replay of a finished refund must not be re-judged
+  against state its own execution changed — the order is now `refunded`, so
+  policy would call it ineligible and turn a safe retry back into a failure.
+- <a id="conflict-do-update"></a>**`ON CONFLICT DO UPDATE`, not `DO NOTHING`.**
+  `DO NOTHING` returns no row and takes no lock, so a concurrent duplicate
+  sails past and tries to read a result the winning transaction hasn't
+  committed yet. Assigning the column to itself is a no-op write that takes
+  the row lock, so the loser blocks until the winner commits and then reads
+  its result.
+- <a id="verdict-race"></a>**The verdict is a conditional `UPDATE` on
+  `status = 'pending'`**, so the database picks the winner of a race. Reading
+  first and then updating would leave a window where two reviewers both
+  believe they won — and each would enqueue a resume.
+- **Both guards stay.** The idempotency key catches a replay of the *same*
+  logical refund; the conditional `UPDATE` on `orders` catches a *different*
+  refund racing for the same order. Two layers, two distinct mistakes.
+- **Rejection requires a reason**, and the model is told plainly that the
+  action was refused and must not be retried — otherwise its closing summary
+  cheerfully reports a refund that never happened.
+- **`completed_at` stays NULL while paused.** The run is suspended, not
+  finished; stamping an end time on it would be a lie the trace viewer would
+  faithfully repeat.
+
+### Bugs hit
+- <a id="jobid-collision"></a>**A ticket returned 201 and then silently never
+  ran.** The run sat at `pending` forever with no steps and nothing anywhere
+  recording a failure. Cause: `jobId` is `run-${runId}`, and BullMQ counts
+  *retained completed and failed* jobs toward id uniqueness, not just live
+  ones — it returns the existing job instead of adding. Meanwhile `db:seed`
+  truncates with `RESTART IDENTITY`, so run ids restart at 1 and collide with
+  yesterday's corpses. The dedup that protects against double-refunds was
+  swallowing legitimate new work. Diagnosed by reading the job out of Redis
+  and finding a `failedReason` from the previous day. Fixed by keeping the
+  live-duplicate case silent (that's the feature) and making a
+  terminal-state collision throw, which `POST /tickets` already knows how to
+  record as `enqueue_failed`. Added `npm run queue:clear`, since resetting
+  the database without resetting the queue leaves two halves of one system
+  disagreeing about what exists.
+- **`verify:queue` claimed to be safe against a live queue and wasn't.** Its
+  first checks asserted on `getWaitingCount()`, which reads 0 when a running
+  worker pulls the scratch job before the next line executes. Now asserts by
+  job id.
+- **A paused run logged "run completed".** The BullMQ job had genuinely
+  succeeded — pausing isn't a failure — but the run was parked waiting on a
+  human, which is close to the opposite. The loop now returns its real
+  terminal state and the worker logs that.
+- <a id="jsonb-key-order"></a>**A test failed because JSONB is not JSON.**
+  Comparing a round-tripped refund result with `JSON.stringify` reported a
+  mismatch on identical values: Postgres normalizes object key order on
+  storage (shortest key first, then bytewise). The code was right and the
+  test was wrong — it now compares field by field.
+
+### Verified
+`npm run verify:approvals` — 12 checks. Validation, unknown approvals, and
+the transitions that would otherwise only surface in production (an approved
+action cannot later be rejected; a failed validation leaves the approval
+pending). The last group fires three approvals simultaneously on separate
+connections and asserts exactly one wins, the losers report
+`already_decided` rather than crashing, and the audit log ends with exactly
+one entry.
+
+`npm run verify:tools` — now 19 checks. Adds: a refund with no idempotency
+key is refused outright; replaying a key succeeds and returns the *original*
+result; a different refund on an already-refunded order is still rejected;
+exactly one row actually paid out.
+
+**Live end-to-end, both paths.** Approved: ticket → `lookup_order` →
+`check_refund_policy` → `issue_refund` **intercepted** (run and ticket
+`awaiting_approval`, `completed_at` NULL, order untouched) → approved via
+API → resumed in the worker → refund executed → model's closing summary
+correctly describes the refund. A double-click on approve during this
+returned 409. Rejected: same up to the gate, then rejected with a reason →
+resumed → nothing executed → **order 1 still `delivered`, no `refunds` row**
+→ the model's summary correctly explains the refusal instead of inventing a
+refund.
+
+Audit log for the approved run, in order: `ticket_received` → `run_started`
+→ `approval_requested` → `approval_granted` → `run_resumed` →
+`refund_issued` → `action_executed` → `run_completed`. For the rejected run:
+`… → approval_rejected → run_resumed → action_rejected → run_completed`.
+
+---
+
+## Next — Week 4: Trace Viewer + Deploy
+- The dashboard: submit a ticket, watch steps stream in, act on the approval
+  queue, see the outcome. Per CLAUDE.md this is what actually gets judged.
+- Deploy to a host with long-running workers (Render/Railway — not
+  serverless, BullMQ needs a persistent process).
+- Demo video as a fallback for when the free tier sleeps.
+- README rewritten as a case study: problem → architecture → what was cut.
+
+### Known gaps, deliberately
+- **Confidence-based gating isn't built.** The gate currently triggers on
+  money-moving tools only. Low-confidence gating needs a confidence signal
+  that isn't just the model marking its own homework, which is a design
+  problem rather than a coding one — see [the gate rationale](#gate-on-tool-name).
+- No auth on the approval endpoints. `reviewed_by` is whatever the caller
+  claims. Fine for a single-tenant demo, not for anything real.

@@ -4,7 +4,7 @@ An AI agent that reads support tickets, checks order/refund data, and decides ac
 but pauses for human approval before executing money-moving actions. Every step is
 logged immutably. Retries can't double-refund.
 
-## Status: Week 2 — Agent Loop + Tool Execution (complete)
+## Status: Week 3 — Approval Gate + Idempotent Execution (complete)
 
 See [PROGRESS.md](PROGRESS.md) for the full week-by-week log: what was
 built, key decisions, and bugs hit along the way.
@@ -51,15 +51,20 @@ built, key decisions, and bugs hit along the way.
 
 ## Verification
 
-Two smoke tests, both runnable without an LLM API key:
+Three smoke tests, all runnable without an LLM API key:
 
 ```
-npm run verify:tools   # the three agent tools, straight against Postgres
-npm run verify:queue   # queue producer: dedup, job shape, retry config
+npm run verify:tools       # the three agent tools + idempotency (19 checks)
+npm run verify:queue       # queue producer: dedup, job shape, retry config
+npm run verify:approvals   # the approval state machine, incl. a real race (12 checks)
 ```
 
-`verify:tools` is destructive — it issues real refunds against seeded orders.
-Restore with `npm run db:seed` afterwards (it reminds you on exit).
+`verify:tools` and `verify:approvals` are destructive — they issue real refunds
+and write scratch rows against seeded data. Restore with `npm run db:seed`.
+
+`npm run queue:clear` drains the queue. Reseeding the database restarts run ids,
+so a queue still holding finished jobs under those ids will silently reject the
+new work — reset both together.
 
 ## API Endpoints
 
@@ -67,6 +72,9 @@ Restore with `npm run db:seed` afterwards (it reminds you on exit).
 - `POST /tickets` — create a ticket, open an agent run, enqueue it for
   processing
 - `GET /tickets/:id/trace` — ticket + latest run + every step + any approvals
+- `GET /approvals` — the review queue: actions waiting on a human
+- `POST /approvals/:id/approve` — `{ reviewed_by, reason? }`
+- `POST /approvals/:id/reject` — `{ reviewed_by, reason }` (reason required)
 
 ## Architecture
 
@@ -78,8 +86,29 @@ POST /tickets ──▶ tickets + agent_runs (Postgres) ──▶ BullMQ queue (
                                                               │
                                                               ▼
                                           orchestrator.ts: Gemini tool loop
-                                          (lookup_order, check_refund_policy,
-                                           issue_refund) — one agent_steps
-                                          row per tool call, audit_log entry
-                                          at start/end of the run
+                                          (lookup_order, check_refund_policy)
+                                                              │
+                                        model wants to issue_refund (money)
+                                                              │
+                                                              ▼
+                                    ┌─────────────────────────────────────┐
+                                    │  GATE: run suspends.                │
+                                    │  approvals row + conversation saved │
+                                    │  status = awaiting_approval         │
+                                    └─────────────────────────────────────┘
+                                                              │
+                                     POST /approvals/:id/approve|reject
+                                                              │
+                                                              ▼
+                                    worker resumes from saved conversation,
+                                    executes the *approved* action with
+                                    idempotency key `approval-<id>`
+                                                              │
+                                                              ▼
+                                    model writes its closing summary; run
+                                    completes. audit_log entry at every step.
 ```
+
+The refund never executes inside the agent loop. The model can only ever
+*propose* it — the gate keys off the tool name in our code, so a model that has
+been talked into refunding still cannot pay anyone.
