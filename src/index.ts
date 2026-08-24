@@ -166,7 +166,13 @@ app.get('/tickets/:id/trace', async (req: Request, res: Response) => {
     }
 
     const runResult = await pool.query<AgentRun>(
-      'SELECT * FROM agent_runs WHERE ticket_id = $1 ORDER BY started_at DESC LIMIT 1',
+      // Explicit columns, not SELECT *: agent_runs carries conversation_state,
+      // which is the entire model conversation. The dashboard polls this route
+      // every couple of seconds, and that column is worker-only state -- nothing
+      // in the UI reads it, and shipping it would make each poll carry the whole
+      // transcript.
+      `SELECT id, ticket_id, status, started_at, completed_at
+         FROM agent_runs WHERE ticket_id = $1 ORDER BY started_at DESC LIMIT 1`,
       [id],
     );
     const run = runResult.rows[0] ?? null;
