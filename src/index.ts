@@ -1,5 +1,8 @@
 import express, { type Request, type Response } from 'express';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import 'dotenv/config';
+import { existsSync } from 'node:fs';
 import pool from './db/connection.js';
 import { enqueueApprovalResume, enqueueTicket } from './queue/ticketQueue.js';
 import { decideApproval } from './approvals/decide.js';
@@ -277,6 +280,23 @@ async function handleDecision(
 
 app.post('/approvals/:id/approve', (req, res) => handleDecision(req, res, 'approved'));
 app.post('/approvals/:id/reject', (req, res) => handleDecision(req, res, 'rejected'));
+
+// The built dashboard, served by the same process as the API so this stays one
+// deployable service and the two share an origin. Registered after the API
+// routes so a real endpoint always wins over a static file of the same name.
+// Absent in dev (Vite serves the frontend itself and proxies here), which is
+// why this is conditional rather than assumed.
+const publicDir = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'public');
+if (existsSync(path.join(publicDir, 'index.html'))) {
+  app.use(express.static(publicDir));
+  // Single-page app: any unmatched GET is a client-side route, not a 404.
+  app.get('*', (_req: Request, res: Response) => {
+    res.sendFile(path.join(publicDir, 'index.html'));
+  });
+  console.log('✓ Serving dashboard from', publicDir);
+} else {
+  console.log('· No built dashboard found (run: npm run build:web). API only.');
+}
 
 app.listen(PORT, () => {
   console.log(`✓ API listening on http://localhost:${PORT}`);

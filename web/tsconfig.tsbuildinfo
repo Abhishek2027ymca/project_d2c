@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/api.ts","./src/main.tsx","./src/types.ts","./src/components/approvalcard.tsx","./src/components/badge.tsx","./src/components/newticket.tsx","./src/components/ticketlist.tsx","./src/components/trace.tsx"],"version":"5.9.3"}

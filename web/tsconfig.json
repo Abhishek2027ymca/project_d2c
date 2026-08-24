@@ -9,6 +9,7 @@
     "noUncheckedIndexedAccess": true,
     "noEmit": true,
     "skipLibCheck": true,
+    "types": ["vite/client"],
     "isolatedModules": true,
     "verbatimModuleSyntax": true
   },
