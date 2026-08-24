@@ -91,6 +91,61 @@ app.post('/tickets', async (req: Request, res: Response) => {
   }
 });
 
+/**
+ * Every ticket with the state of its latest run — the dashboard's list view.
+ *
+ * The run fields come from a LATERAL join rather than a plain LEFT JOIN: a
+ * ticket can accumulate several runs, and this needs the newest one per ticket
+ * rather than a row per run. Doing it in SQL keeps the list a single query
+ * instead of N+1 lookups as the demo data grows.
+ */
+app.get('/tickets', async (_req: Request, res: Response) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT t.id, t.customer_id, t.order_id, t.message, t.status, t.created_at,
+              c.name AS customer_name,
+              r.id AS run_id, r.status AS run_status, r.started_at, r.completed_at,
+              (SELECT COUNT(*) FROM agent_steps s WHERE s.run_id = r.id) AS step_count,
+              (SELECT COUNT(*) FROM approvals a
+                WHERE a.run_id = r.id AND a.status = 'pending') AS pending_approvals
+         FROM tickets t
+         JOIN customers c ON c.id = t.customer_id
+    LEFT JOIN LATERAL (
+              SELECT id, status, started_at, completed_at
+                FROM agent_runs
+               WHERE ticket_id = t.id
+            ORDER BY started_at DESC
+               LIMIT 1
+         ) r ON TRUE
+     ORDER BY t.created_at DESC, t.id DESC`,
+    );
+    res.json({ tickets: rows });
+  } catch (err) {
+    console.error('GET /tickets failed:', err);
+    res.status(500).json({ error: 'Failed to list tickets' });
+  }
+});
+
+/**
+ * Customers and their orders, for the ticket submission form.
+ *
+ * Exists so the demo can offer real ids to pick from. Typing a customer_id that
+ * trips a foreign key is a bad first impression of an app whose whole pitch is
+ * that it does not act on bad data.
+ */
+app.get('/demo-data', async (_req: Request, res: Response) => {
+  try {
+    const [customers, orders] = await Promise.all([
+      pool.query('SELECT id, name, email FROM customers ORDER BY id'),
+      pool.query('SELECT id, customer_id, status, amount, created_at FROM orders ORDER BY id'),
+    ]);
+    res.json({ customers: customers.rows, orders: orders.rows });
+  } catch (err) {
+    console.error('GET /demo-data failed:', err);
+    res.status(500).json({ error: 'Failed to load demo data' });
+  }
+});
+
 /** Full trace for one ticket: the run, every step it took, and any approvals. */
 app.get('/tickets/:id/trace', async (req: Request, res: Response) => {
   const id = Number(req.params.id);
