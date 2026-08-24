@@ -4,7 +4,7 @@ An AI agent that reads support tickets, checks order/refund data, and decides ac
 but pauses for human approval before executing money-moving actions. Every step is
 logged immutably. Retries can't double-refund.
 
-## Status: Week 3 — Approval Gate + Idempotent Execution (complete)
+## Status: Week 4 — Trace Viewer (dashboard built; deploy pending)
 
 See [PROGRESS.md](PROGRESS.md) for the full week-by-week log: what was
 built, key decisions, and bugs hit along the way.
@@ -37,11 +37,22 @@ built, key decisions, and bugs hit along the way.
    npm run db:seed
    ```
 
-7. Start the API and the worker (two separate processes):
+7. Build the dashboard:
    ```
-   npm run dev      # API
+   npm run build:web
+   ```
+
+8. Start the API and the worker (two separate processes):
+   ```
+   npm run dev      # API + dashboard on http://localhost:3000
    npm run worker   # agent loop consumer
    ```
+
+   Then open **http://localhost:3000**.
+
+   While working on the frontend, run `npm run dev:web` as a third process
+   instead — Vite serves it on :5173 with hot reload and proxies API calls
+   to :3000.
 
 > `docker-compose.yml` is kept in the repo as a local-dev fallback but isn't
 > the primary path right now — Docker Desktop wasn't working reliably on the
@@ -72,6 +83,8 @@ new work — reset both together.
 - `POST /tickets` — create a ticket, open an agent run, enqueue it for
   processing
 - `GET /tickets/:id/trace` — ticket + latest run + every step + any approvals
+- `GET /tickets` — every ticket with the state of its latest run
+- `GET /demo-data` — customers and orders, for the submission form
 - `GET /approvals` — the review queue: actions waiting on a human
 - `POST /approvals/:id/approve` — `{ reviewed_by, reason? }`
 - `POST /approvals/:id/reject` — `{ reviewed_by, reason }` (reason required)
@@ -112,3 +125,16 @@ POST /tickets ──▶ tickets + agent_runs (Postgres) ──▶ BullMQ queue (
 The refund never executes inside the agent loop. The model can only ever
 *propose* it — the gate keys off the tool name in our code, so a model that has
 been talked into refunding still cannot pay anyone.
+
+## Dashboard
+
+`web/` is a Vite + React app built into `public/`, which the API serves — one
+deployable service, no CORS. Submit a ticket, watch the agent's steps appear,
+approve or reject what it's waiting on, see the outcome.
+
+The gate step is styled distinctly from the rest of the timeline: a reviewer
+should see at a glance that the agent *stopped* rather than proceeded, since
+that's the difference the whole project is about.
+
+Refresh is a 2s poll, not SSE — a run finishes in ~20s, and polling stops on
+its own once nothing is in flight.
