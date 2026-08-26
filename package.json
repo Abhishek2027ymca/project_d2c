@@ -16,7 +16,7 @@
     "verify:queue": "tsx src/scripts/verifyQueue.ts",
     "queue:clear": "tsx src/scripts/clearQueue.ts",
     "verify:approvals": "tsx src/scripts/verifyApprovals.ts",
-    "build:web": "npm --prefix web install && npm --prefix web run build",
+    "build:web": "cd web && npm install && npm run build",
     "dev:web": "npm --prefix web run dev"
   },
   "keywords": [],
