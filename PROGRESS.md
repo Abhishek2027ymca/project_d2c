@@ -47,8 +47,12 @@ jumps straight to the decision, wherever it lives below.
 **Bugs worth retelling**
 - [A ticket returned 201 and then silently never ran](#jobid-collision)
 - [A test failed because JSONB is not JSON](#jsonb-key-order)
+- [SELECT * quietly started shipping the model conversation](#select-star-conversation)
 
-*Week 4 will add: the trace viewer, deploy, the case-study README.*
+**The dashboard**
+- [Submit, watch, approve, reject — one deployable service](#dashboard)
+
+*Next: deploy, and a short demo video.*
 
 ---
 
@@ -405,13 +409,66 @@ Audit log for the approved run, in order: `ticket_received` → `run_started`
 
 ---
 
-## Next — Week 4: Trace Viewer + Deploy
-- The dashboard: submit a ticket, watch steps stream in, act on the approval
-  queue, see the outcome. Per CLAUDE.md this is what actually gets judged.
-- Deploy to a host with long-running workers (Render/Railway — not
-  serverless, BullMQ needs a persistent process).
-- Demo video as a fallback for when the free tier sleeps.
-- README rewritten as a case study: problem → architecture → what was cut.
+## Week 4 — Trace Viewer + Case Study (2026-08-24 → 2026-08-26)
+
+### Built
+- <a id="dashboard"></a>**The dashboard** (`web/` — Vite + React) — submit a
+  ticket, watch `agent_steps` appear in near-real-time, act on whatever's
+  pending, see the outcome. Built into `public/` and served by the existing
+  Express process: one deployable service, no CORS, no second host to keep
+  awake.
+- `GET /tickets` (latest-run-per-ticket via a `LEFT JOIN LATERAL`, so the
+  list is one query rather than N+1) and `GET /demo-data`, for the list view
+  and the submission form.
+- The gate step is styled distinctly in the timeline (amber, labelled `…held
+  at gate`) — the moment the agent stops is the entire point of the project,
+  and it needs to read as different from an ordinary tool call, not just be
+  technically correct underneath.
+- The approval card renders the *stored* proposed action, not a re-derived
+  summary — because that stored action is exactly what executes if approved.
+  It mirrors the API's rule that rejecting needs a reason, so the constraint
+  shows up as a disabled button, not a 400 the user has to decode.
+- Refresh is a 2s poll, not SSE/websockets. A run finishes in ~20s, and
+  polling stops on its own once nothing in the ticket list or open trace is
+  in a live state — worth revisiting only if runs get materially longer.
+- [The README rewritten as a case study](README.md) — problem, architecture,
+  five design decisions with the failure mode each prevents, and what was
+  deliberately cut and why, rather than just setup steps and an endpoint
+  list.
+- Verified the actual production build end to end: `npm run build` (`tsc` +
+  the Vite build) followed by `node dist/index.js` and `node dist/worker.js`
+  separately — the shape a host like Render will run — both start clean and
+  `dist/index.js` resolves `public/` correctly relative to itself.
+
+### Bugs hit
+- <a id="select-star-conversation"></a>**`GET /tickets/:id/trace` was
+  shipping the entire model conversation on every poll.** It read
+  `agent_runs` with `SELECT *`, which was harmless in Week 2 — nothing wide
+  lived on that table yet. Week 3 added `conversation_state`, the full
+  persisted Gemini conversation used to resume a paused run, and the query
+  started returning it too. Nothing in the dashboard reads that column; it's
+  worker-only state. Caught by actually loading the dashboard against a live
+  paused run and noticing the response size, not by anything a type checker
+  could catch — `SELECT *` typed fine the whole way through. Fixed to
+  explicit columns. The lesson worth keeping: a `SELECT *` cost can stay
+  invisible for an entire week and only appear once a wide column lands on a
+  table that used to be narrow — exactly the moment nobody thinks to
+  re-check the queries already reading it.
+
+### Verified
+Every endpoint the dashboard depends on, hit directly: `/`, `/health`,
+`/tickets`, `/demo-data`, `/approvals`, `/tickets/:id/trace`, and the built
+JS asset — all `200`, trace payload measured at 1.7KB after the fix (down
+from shipping a full conversation transcript). Confirmed API routes still
+win over the static/catch-all handlers, and an unmatched client route
+returns the SPA shell rather than a 404.
+
+Full loop through the dashboard's own code path, not just the API: ticket
+submitted from the form → gate hit, approval card shows the exact proposed
+action → approved with a reviewer name → steps stream in as the worker
+resumes → order flips to `refunded` in the trace. Same for reject: card
+requires a reason before the button enables, run resumes, nothing executes,
+model's closing summary explains the refusal.
 
 ### Known gaps, deliberately
 - **Confidence-based gating isn't built.** The gate currently triggers on
@@ -420,3 +477,11 @@ Audit log for the approved run, in order: `ticket_received` → `run_started`
   problem rather than a coding one — see [the gate rationale](#gate-on-tool-name).
 - No auth on the approval endpoints. `reviewed_by` is whatever the caller
   claims. Fine for a single-tenant demo, not for anything real.
+
+---
+
+## Next — Deploy
+- Render/Railway for the API + worker as two processes (not serverless —
+  BullMQ workers block on the queue), pointing at the existing Neon and
+  Upstash instances.
+- A short demo video, as a fallback for when a free-tier host is asleep.
