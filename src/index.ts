@@ -6,10 +6,12 @@ import { existsSync } from 'node:fs';
 import pool from './db/connection.js';
 import { enqueueApprovalResume, enqueueTicket } from './queue/ticketQueue.js';
 import { decideApproval } from './approvals/decide.js';
+import { startWorker } from './worker.js';
 import type { AgentRun, AgentStep, Approval, Ticket } from './types.js';
 
 const app = express();
-const PORT = Number(process.env.API_PORT ?? 3000);
+// PORT is the host-injected var (Render, Railway, ...); API_PORT is the local/Docker override.
+const PORT = Number(process.env.PORT ?? process.env.API_PORT ?? 3000);
 
 app.use(express.json());
 
@@ -304,6 +306,20 @@ if (existsSync(path.join(publicDir, 'index.html'))) {
   console.log('· No built dashboard found (run: npm run build:web). API only.');
 }
 
+// Single-process deploys (e.g. Render's free tier, which has no free
+// background-worker instance type) run the queue consumer inside the API
+// process instead of as a second `node dist/worker.js` process.
+const embeddedWorker = process.env.EMBED_WORKER === 'true' ? startWorker() : undefined;
+
 app.listen(PORT, () => {
   console.log(`✓ API listening on http://localhost:${PORT}`);
 });
+
+if (embeddedWorker) {
+  const shutdown = async (): Promise<void> => {
+    await embeddedWorker.close();
+    process.exit(0);
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+}
