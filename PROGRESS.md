@@ -52,7 +52,11 @@ jumps straight to the decision, wherever it lives below.
 **The dashboard**
 - [Submit, watch, approve, reject — one deployable service](#dashboard)
 
-*Next: deploy, and a short demo video.*
+**Deploy**
+- [Render's free tier has no free background worker — embed it instead](#embed-worker)
+- [NODE_ENV=production silently drops devDependencies mid-build](#devdeps-omitted)
+
+*Next: a short demo video.*
 
 ---
 
@@ -480,8 +484,80 @@ model's closing summary explains the refusal.
 
 ---
 
-## Next — Deploy
-- Render/Railway for the API + worker as two processes (not serverless —
-  BullMQ workers block on the queue), pointing at the existing Neon and
-  Upstash instances.
-- A short demo video, as a fallback for when a free-tier host is asleep.
+## Week 5 — Deploy (2026-09-08)
+
+### Built
+- <a id="embed-worker"></a>**Single-process deploy mode.** `src/worker.ts`
+  now exports `startWorker()`, with the standalone `npm run worker`
+  entrypoint gated behind an `import.meta.url` main-module check so it only
+  self-starts when run directly. `src/index.ts` calls `startWorker()` when
+  `EMBED_WORKER=true`. Render's free tier has no free background-worker
+  instance type — only free web services — so this runs the BullMQ consumer
+  inside the API process instead of paying for a second one. `npm run
+  worker` / `node dist/worker.js` as a standalone process is unchanged, for
+  local two-process dev or a host that does support a separate worker
+  (Railway, Fly.io).
+- Bind to the host-injected `PORT`, falling back to `API_PORT` then `3000` —
+  Render (and most PaaS hosts) inject `PORT`, which `API_PORT` was never
+  wired to read.
+- `render.yaml` — a Render Blueprint at the repo root, so the service is
+  provisioned by connecting the repo rather than clicking through manual
+  dashboard settings. Secrets (`DATABASE_URL`, `REDIS_URL`,
+  `GEMINI_API_KEY`, `GEMINI_MODEL`) are `sync: false` — filled in via the
+  Render dashboard, never committed.
+
+### Bugs hit
+- **First build failed on every dependency** ("Cannot find module
+  'express'", `'pg'`, `'bullmq'`, ...). `render.yaml`'s `buildCommand` was
+  just `npm run build` — a custom build command *replaces* Render's default
+  install step rather than running alongside it, so `node_modules` was never
+  populated. Fixed by making the install explicit: `npm ci && npm run
+  build`.
+- <a id="devdeps-omitted"></a>**`npm ci` on Render then dropped `@types/pg`
+  and `@types/express` (and, separately, `web/`'s `vite`) while installing
+  everything else fine — `tsc` failed on missing type declarations for
+  packages that were correctly pinned in `package-lock.json`.** Root cause:
+  npm still omits `devDependencies` by default when `NODE_ENV=production` is
+  set during install, and `render.yaml` sets exactly that env var for the
+  running service. It wasn't a blanket omission, which is what made it
+  confusing to read from the build log alone — `typescript` itself still
+  ran, because Render's build image has a global `tsc` on `PATH` as a
+  fallback, so some devDependencies were visibly present (`tsc` ran) while
+  others (`@types/pg`, `@types/express`) were just silently missing.
+  Reproduced locally with `NODE_ENV=production npm ci` before touching
+  anything — same package count (143) as the Render log, same two packages
+  missing, and *there* `tsc` was genuinely absent too (no global fallback on
+  a dev machine), which confirmed the mechanism instead of guessing at it
+  from symptoms. Fixed by forcing `--include=dev` on both installs:
+  `render.yaml`'s `buildCommand`, and the `build:web` script (`cd web && npm
+  install --include=dev && npm run build`) — the nested install inherits the
+  parent process's `NODE_ENV` too, so it needed the identical fix
+  independently, not just the outer one.
+
+### Verified
+`curl` against the live deploy: `/health` → `{"status":"ok","db":"up"}`,
+`/demo-data` and `/tickets` returning real rows from the same Neon database
+used throughout local dev (no separate prod database — see gaps below).
+
+Full loop through the live dashboard, not just curl: a non-money-moving
+ticket (`lookup_order` → summary) completed with no gate; a money-moving one
+(`issue_refund`, $15.50) stopped at the gate exactly as designed, was
+approved through the UI, and the embedded worker picked the resume job back
+up and executed the refund — confirming the worker half of the
+embedded-process change actually consumes jobs in production, not just that
+the API half boots.
+
+### Known gaps, deliberately
+- No staging environment — the same Neon/Upstash instances serve local dev
+  and production. Fine for a single-maintainer demo; a real deploy would
+  separate them.
+- Free-tier spin-down is accepted, not solved — the first request after
+  ~15 minutes idle takes ~50s. A demo video is the fallback for exactly
+  this, not yet recorded.
+
+---
+
+## Next
+- A short demo video, as a fallback for when the free-tier host is asleep.
+- The gaps above, roughly in the order a real support-ops team would ask for
+  them: auth first, confidence-based gating second, everything else after.

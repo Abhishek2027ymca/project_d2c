@@ -5,9 +5,11 @@ data, and decides what to do — but it cannot move money on its own. When it
 wants to issue a refund, it stops and waits for a human. Every step it takes is
 logged immutably, and a retried action can never pay out twice.
 
-**Status:** dashboard built, deploy pending. See [PROGRESS.md](PROGRESS.md) for
-the full week-by-week engineering log — what was built, the reasoning behind
-each decision, and the bugs hit along the way.
+**Status:** live at
+[support-ops-agent-49ap.onrender.com](https://support-ops-agent-49ap.onrender.com).
+See [PROGRESS.md](PROGRESS.md) for the full week-by-week engineering log —
+what was built, the reasoning behind each decision, and the bugs hit along
+the way.
 
 ## The problem
 
@@ -193,13 +195,25 @@ Scoped deliberately for a one-month build, not because these don't matter:
 > shape either way (`src/db/connection.ts`, `src/queue/connection.ts`), so
 > switching back later is a config change, not a code change.
 
-**Production build**, the shape a host like Render or Railway will run:
+**Production build**, the shape actually deployed:
 
 ```
 npm run build     # tsc -> dist/, then builds the dashboard into public/
 npm start         # node dist/index.js — API + dashboard
-node dist/worker.js  # the queue consumer, as a second process
 ```
+
+Live on Render's free tier as a single web service — `render.yaml` at the
+repo root is a Render Blueprint that provisions it directly from this repo
+(connect the repo, fill in the secret env vars, deploy). Render's free tier
+has no free background-worker instance type, only free web services, so
+`EMBED_WORKER=true` runs the BullMQ worker inside the API process instead of
+as `node dist/worker.js` on a second, paid one — `src/worker.ts` exports
+`startWorker()` for exactly this. `npm run worker` still runs it standalone,
+for local two-process dev or a host that does support a separate worker.
+Binds to the host-injected `PORT`, falling back to `API_PORT`/3000 locally.
+
+Free tier means the service spins down after ~15 minutes idle — the first
+request after that takes ~50s to wake it back up.
 
 ## Verification
 
@@ -245,9 +259,6 @@ its own once nothing is in flight.
 
 ## Next steps
 
-- Deploy: Render/Railway for the API + worker (needs a persistent process —
-  not serverless, since BullMQ workers block waiting on the queue), pointing
-  at the existing Neon and Upstash instances.
-- A short demo video, as a fallback for when a free-tier host is asleep.
+- A short demo video, as a fallback for when the free-tier host is asleep.
 - The gaps above, roughly in the order a real support-ops team would ask for
   them: auth first, confidence-based gating second, everything else after.
